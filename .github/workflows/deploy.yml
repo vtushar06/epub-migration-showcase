@@ -27,14 +27,9 @@ jobs:
 
       - name: Clone foliate-js dependency
         run: |
-          echo "Cloning foliate-js for GitHub Pages deployment..."
-          rm -rf foliate-js
-          git clone --depth 1 https://github.com/johnfactotum/foliate-js.git
-
-      - name: Copy foliate-js into showcase
-        run: |
-          cp -r foliate-js epub-migration-showcase/foliate-js
-          echo "foliate-js copied into epub-migration-showcase/"
+          echo "Cloning foliate-js directly into showcase directory..."
+          rm -rf epub-migration-showcase/foliate-js
+          git clone --depth 1 https://github.com/johnfactotum/foliate-js.git epub-migration-showcase/foliate-js
 
       - name: Create .nojekyll file
         run: |
