@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'self' blob:; script-src 'self' 'unsafe-inline';
+                   style-src 'self' blob: 'unsafe-inline';
+                   img-src 'self' blob: data:;
+                   frame-src blob: data:;">
+    <title>Foliate Viewer</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: white;
+            font-family: system-ui, sans-serif;
+        }
+        #container {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+        }
+        #viewer {
+            flex: 1;
+            position: relative;
+            overflow: hidden;
+        }
+        foliate-view {
+            width: 100%;
+            height: 100%;
+        }
+        .status {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: #757575;
+            font-size: 14px;
+        }
+        .status.error { color: #F44336; }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <div id="viewer">
+            <div class="status" id="status">Waiting for EPUB...</div>
+        </div>
+    </div>
+
+    <script type="module">
+        // Import foliate-js View class - this auto-registers 'foliate-view' custom element
+        import './foliate-js/view.js';
+
+        // Security: Only accept messages from parent window origin
+        const PARENT_ORIGIN = window.location.origin || 'http://localhost:8082';
+
+        const viewer = document.getElementById('viewer');
+        const status = document.getElementById('status');
+        let view = null;
+
+        // Send message to parent
+        function postToParent(type, data = {}) {
+            window.parent.postMessage({ type, ...data }, PARENT_ORIGIN);
+        }
+
+        // Show status message
+        function showStatus(msg, isError = false) {
+            status.textContent = msg;
+            status.className = 'status' + (isError ? ' error' : '');
+            status.style.display = 'flex';
+        }
+
+        // Hide status
+        function hideStatus() {
+            status.style.display = 'none';
+        }
+
+        // Open book
+        async function openBook(file) {
+            console.log('[foliate] Opening:', file?.name);
+            showStatus('Loading...');
+
+            try {
+                // Remove existing view if any
+                if (view) {
+                    // Memory cleanup: Call close() to invoke Loader.destroy()
+                    try {
+                        view.close();
+                        postToParent('CLEANUP_COMPLETE', {
+                            message: 'Loader.destroy() called — all blob URLs revoked'
+                        });
+                    } catch(e) {
+                        // close() may not exist in all versions
+                        console.warn('[foliate] view.close() not available:', e);
+                    }
+                    view.remove();
+                    view = null;
+                }
+
+                // Create new foliate-view element
+                view = document.createElement('foliate-view');
+                viewer.appendChild(view);
+
+                // Listen for progress updates
+                view.addEventListener('relocate', (e) => {
+                    const { fraction, location, tocItem, cfi } = e.detail || {};
+                    postToParent('RELOCATE', {
+                        fraction: fraction || 0,
+                        location: location || {},
+                        tocItem: tocItem || null,
+                        cfi: cfi || ''
+                    });
+                });
+
+                // Create a promise that resolves on first load
+                const firstLoadPromise = new Promise(resolve => {
+                    view.addEventListener('load', resolve, { once: true });
+                });
+
+                // Listen for subsequent load events
+                view.addEventListener('load', () => {
+                    console.log('[foliate] Section loaded');
+                });
+
+                // Open the EPUB file
+                await view.open(file);
+
+                // Trigger initial render (required by foliate-js)
+                if (view.renderer && typeof view.renderer.next === 'function') {
+                    view.renderer.next();
+                } else {
+                    console.warn('[foliate] view.renderer not available after open()');
+                }
+
+                // Wait for the first section to load before navigating
+                await firstLoadPromise;
+
+                hideStatus();
+
+                // Send ready with metadata
+                const book = view.book;
+                postToParent('READY', {
+                    title: book?.metadata?.title || file.name,
+                    author: book?.metadata?.author || '',
+                    language: book?.metadata?.language || '',
+                    sections: book?.sections?.length || 0
+                });
+
+                console.log('[foliate] Book ready:', book?.metadata?.title);
+
+            } catch (err) {
+                console.error('[foliate] Error:', err);
+                showStatus('Error: ' + err.message, true);
+                postToParent('ERROR', { message: err.message });
+            }
+        }
+
+        // Search functionality
+        async function performSearch(query) {
+            if (!view || !query) return;
+            const results = [];
+            try {
+                for await (const result of view.search({ query, index: 0 })) {
+                    if (result.progress !== undefined) {
+                        // Send progress update to parent
+                        postToParent('SEARCH_PROGRESS', {
+                            progress: result.progress
+                        });
+                    }
+                    if (result.subitems) {
+                        results.push(...result.subitems);
+                        // Send results progressively
+                        postToParent('SEARCH_RESULTS', {
+                            results: results.slice(0, 20),
+                            total: results.length
+                        });
+                    }
+                }
+                postToParent('SEARCH_DONE', {
+                    total: results.length
+                });
+            } catch(e) {
+                console.error('[foliate] Search error:', e);
+            }
+        }
+
+        // Navigate to location
+        function goTo(target) {
+            if (view) {
+                view.goTo(target);
+            }
+        }
+
+        // Navigation
+        function goNext() {
+            if (view) {
+                view.goRight();
+            }
+        }
+
+        function goPrev() {
+            if (view) {
+                view.goLeft();
+            }
+        }
+
+        function goToFraction(frac) {
+            if (view) {
+                view.goToFraction(frac);
+            }
+        }
+
+        // Listen for messages from parent
+        window.addEventListener('message', async (e) => {
+            // Security: Only accept messages from our parent window
+            if (e.source !== window.parent) return;
+
+            const { type } = e.data || {};
+
+            switch (type) {
+                case 'OPEN_BOOK':
+                    if (e.data.file) {
+                        await openBook(e.data.file);
+                    }
+                    break;
+                case 'NEXT':
+                    goNext();
+                    break;
+                case 'PREV':
+                    goPrev();
+                    break;
+                case 'GO_TO':
+                    if (typeof e.data.fraction === 'number') {
+                        goToFraction(e.data.fraction);
+                    }
+                    break;
+                case 'SEARCH':
+                    if (e.data.query) {
+                        await performSearch(e.data.query);
+                    }
+                    break;
+                case 'GOTO':
+                    if (e.data.target) {
+                        goTo(e.data.target);
+                    }
+                    break;
+                case 'SET_THEME':
+                    if (view?.renderer && e.data.css) {
+                        view.renderer.setStyles(e.data.css);
+                    }
+                    break;
+            }
+        });
+
+        // Signal ready
+        postToParent('FRAME_READY');
+        console.log('[foliate] Frame ready');
+
+        // Memory cleanup: Clean up on page unload
+        window.addEventListener('beforeunload', () => {
+            if (view) {
+                try {
+                    view.close();
+                } catch(e) {
+                    console.warn('[foliate] Error during cleanup:', e);
+                }
+            }
+        });
+    </script>
+</body>
+</html>

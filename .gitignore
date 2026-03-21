@@ -1,0 +1,26 @@
+# Local foliate-js symlink (do not commit - workflow handles it)
+foliate-js/
+
+# Large EPUB test files (optional - commit small ones, ignore large)
+# public/epubs/*.epub
+
+# System files
+.DS_Store
+Thumbs.db
+.AppleDouble
+.LSOverride
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+npm-debug.log*
+
+# Temporary files
+.tmp/
+temp/

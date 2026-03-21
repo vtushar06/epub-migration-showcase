@@ -1,0 +1,61 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Clone foliate-js dependency
+        run: |
+          echo "Cloning foliate-js for GitHub Pages deployment..."
+          git clone --depth 1 https://github.com/johnfactotum/foliate-js.git
+
+      - name: Copy foliate-js into showcase
+        run: |
+          cp -r foliate-js epub-migration-showcase/foliate-js
+          echo "foliate-js copied into epub-migration-showcase/"
+
+      - name: Create .nojekyll file
+        run: |
+          touch epub-migration-showcase/.nojekyll
+          echo ".nojekyll created to prevent Jekyll processing"
+
+      - name: Verify structure
+        run: |
+          echo "=== Directory structure ==="
+          ls -la epub-migration-showcase/
+          echo ""
+          echo "=== foliate-js exists? ==="
+          ls -la epub-migration-showcase/foliate-js/ | head -5
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: './epub-migration-showcase'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
