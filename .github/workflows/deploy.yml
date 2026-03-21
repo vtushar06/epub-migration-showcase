@@ -27,22 +27,26 @@ jobs:
 
       - name: Clone foliate-js dependency
         run: |
-          echo "Cloning foliate-js directly into showcase directory..."
-          rm -rf epub-migration-showcase/foliate-js
-          git clone --depth 1 https://github.com/johnfactotum/foliate-js.git epub-migration-showcase/foliate-js
+          echo "Cloning foliate-js for deployment..."
+          git clone --depth 1 https://github.com/johnfactotum/foliate-js.git /tmp/foliate-js
+          rm -rf /tmp/foliate-js/.git
 
-      - name: Create .nojekyll file
+      - name: Prepare deployment directory
         run: |
-          touch epub-migration-showcase/.nojekyll
-          echo ".nojekyll created to prevent Jekyll processing"
+          echo "Creating deployment directory outside git workspace..."
+          mkdir -p /tmp/deploy
+          cp -r epub-migration-showcase/* /tmp/deploy/
+          cp -r /tmp/foliate-js /tmp/deploy/foliate-js
+          touch /tmp/deploy/.nojekyll
+          echo "Deployment directory ready at /tmp/deploy"
 
       - name: Verify structure
         run: |
-          echo "=== Directory structure ==="
-          ls -la epub-migration-showcase/
+          echo "=== Deployment directory structure ==="
+          ls -la /tmp/deploy/ | head -10
           echo ""
           echo "=== foliate-js exists? ==="
-          ls -la epub-migration-showcase/foliate-js/ | head -5
+          ls -la /tmp/deploy/foliate-js/ | head -5
 
       - name: Setup Pages
         uses: actions/configure-pages@v4
@@ -50,7 +54,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: './epub-migration-showcase'
+          path: '/tmp/deploy'
 
       - name: Deploy to GitHub Pages
         id: deployment
