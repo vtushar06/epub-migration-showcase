@@ -4,13 +4,24 @@
 
 ## Quick Start
 
+### For Local Development
+
 ```bash
-# Start local server
+# 1. Clone foliate-js dependency (required for local testing)
+./setup-local.sh
+
+# 2. Start local server
 python3 -m http.server 8080
 
-# Open in browser
+# 3. Open in browser
 open http://localhost:8080
 ```
+
+**Note:** The `foliate-js/` directory is gitignored and automatically cloned during GitHub Pages deployment. For local development, run `./setup-local.sh` first to clone it.
+
+### Viewing on GitHub Pages
+
+The site is automatically deployed to GitHub Pages when changes are pushed to main. No setup needed - just visit: https://vtushar06.github.io/epub-migration-showcase/
 
 ## Features
 
@@ -45,7 +56,8 @@ epub-migration-showcase/
 ├── app.js              # Vue 3 app with research data
 ├── styles.css          # Clean styles
 ├── foliate-inner.html  # foliate-js iframe viewer
-├── foliate-js/         # Symlink to ../foliate-js
+├── foliate-js/         # Cloned from github.com/johnfactotum/foliate-js (gitignored)
+├── setup-local.sh      # Setup script for local development
 └── public/epubs/       # Sample EPUB files
 ```
 
