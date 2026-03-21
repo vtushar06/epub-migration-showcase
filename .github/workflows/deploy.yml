@@ -28,6 +28,7 @@ jobs:
       - name: Clone foliate-js dependency
         run: |
           echo "Cloning foliate-js for GitHub Pages deployment..."
+          rm -rf foliate-js
           git clone --depth 1 https://github.com/johnfactotum/foliate-js.git
 
       - name: Copy foliate-js into showcase
