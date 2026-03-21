@@ -35,7 +35,7 @@ jobs:
         run: |
           echo "Creating deployment directory outside git workspace..."
           mkdir -p /tmp/deploy
-          cp -r epub-migration-showcase/* /tmp/deploy/
+          cp -r ./* /tmp/deploy/
           cp -r /tmp/foliate-js /tmp/deploy/foliate-js
           touch /tmp/deploy/.nojekyll
           echo "Deployment directory ready at /tmp/deploy"
