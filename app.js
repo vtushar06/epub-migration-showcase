@@ -2,6 +2,10 @@
    EPUB Migration Showcase
    epub.js vs foliate-js comparison
    Kolibri GSoC 2026
+
+   Architecture: The foliate-js side uses the NATIVE EPUB class
+   (epub.js) with a custom zip.js loader, bypassing view.js entirely.
+   This matches the production architecture agreed with Richard Tibbles.
    ======================================== */
 
 const { createApp, ref, computed, onMounted, nextTick, watch } = Vue;
@@ -12,6 +16,7 @@ const SAMPLE_EPUBS = [
     { name: 'EPUB 3.0 Specification', file: 'epub3-spec.epub', desc: 'Technical specification document' },
     { name: 'RTL Book', file: 'rtl-book.epub', desc: 'Right-to-left language book' },
     { name: 'Tinsiima', file: 'tinsiima.epub', desc: 'African storybook with images' },
+    { name: '♪ SMIL Audio Demo', file: 'smil-demo.epub', desc: 'Read-aloud with synchronized audio highlights (GSoC stretch goal)' },
 ];
 
 // Key bugs found from research (MASTER_GUIDE.md)
@@ -58,11 +63,11 @@ const RESEARCH_BUGS = [
         impact: 'MEDIUM',
         frequency: 'Every close',
         epubjs: 'Visualization — epub.js issue #688 confirms book.destroy() fails to remove JSZip heap memory. Reporter documented this persists even with explicit destroy() calls. Issue closed as fixed in 2018 but fix was ineffective.',
-        foliate: 'Loader.destroy() revokes all blob URLs on close',
+        foliate: 'book.destroy() → Loader.destroy() revokes ALL cached blob URLs via ref-counted #cache Map (epub.js:906-908)',
         code: 'EpubRendererIndex.vue:513-522',
         kolibri_issue: 'N/A',
         epubjs_issue: 'N/A',
-        ref: 'EpubRendererIndex.vue:513-522'
+        ref: 'epub.js:1080-1081 → epub.js:906-908'
     },
     {
         id: 'images',
@@ -95,10 +100,11 @@ const COMPARISON_DATA = [
     { metric: 'Dependencies', epubjs: '11 packages', foliate: '0 (zero)', winner: 'foliate' },
     { metric: 'Code Size', epubjs: '13,768 lines', foliate: '2,919 lines', winner: 'foliate' },
     { metric: 'Last Update', epubjs: '2022', foliate: '2024', winner: 'foliate' },
-    { metric: 'Progress Tracking', epubjs: 'Unreliable', foliate: 'Byte-accurate', winner: 'foliate' },
-    { metric: 'Touch/Swipe', epubjs: 'None', foliate: 'Built-in (567 lines)', winner: 'foliate' },
+    { metric: 'Progress Tracking', epubjs: 'Unreliable (locations.generate)', foliate: 'Byte-accurate (SectionProgress geometry)', winner: 'foliate' },
+    { metric: 'Touch/Swipe', epubjs: 'None', foliate: 'Built-in (Paginator 567 lines)', winner: 'foliate' },
     { metric: 'RTL Support', epubjs: 'Buggy', foliate: 'Intl.Locale auto-detect', winner: 'foliate' },
     { metric: 'Search', epubjs: 'Blocks UI', foliate: 'Async generator', winner: 'foliate' },
+    { metric: 'view.js Required?', epubjs: 'N/A', foliate: 'No — Native EPUB class + Paginator', winner: 'foliate' },
 ];
 
 const App = {
@@ -225,7 +231,7 @@ const App = {
 
                     <!-- Theme Switching -->
                     <div class="theme-bar" v-if="foliateReady" style="padding:8px 16px; border-top:1px solid #e0e0e0; border-bottom:1px solid #e0e0e0; display:flex; gap:8px; align-items:center; background:#f5f5f5;">
-                        <small style="color:#757575; font-weight:500;">Themes via renderer.setStyles():</small>
+                        <small style="color:#757575; font-weight:500;">Themes via paginator.setStyles():</small>
                         <button
                             v-for="t in themes" :key="t.name"
                             @click="applyTheme(t)"
@@ -269,6 +275,99 @@ const App = {
                         </div>
                     </div>
 
+                    <!-- ====================================================
+                         SMIL MEDIA OVERLAY — Audio Control Panel (Phase 3)
+                         GSoC 2026 Stretch Goal: Read-Aloud Functionality
+
+                         This panel appears only when an EPUB has SMIL media
+                         overlays. It provides play/pause/stop/skip controls
+                         with volume and playback rate adjustment.
+                         ==================================================== -->
+                    <div class="audio-panel" v-if="hasMediaOverlay && foliateReady" style="
+                        padding: 10px 16px;
+                        border-bottom: 2px solid #2E7D32;
+                        background: linear-gradient(135deg, #E8F5E9, #C8E6C9);
+                        font-size: 13px;
+                    ">
+                        <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">
+                            <span style="font-size:18px;">♪</span>
+                            <strong style="color:#2E7D32; font-size:13px;">SMIL Read-Aloud</strong>
+                            <span style="color:#4CAF50; font-size:11px; background:#fff; padding:2px 8px; border-radius:10px; border:1px solid #4CAF50;">
+                                {{ mediaOverlaySections }} section{{ mediaOverlaySections > 1 ? 's' : '' }} with audio
+                            </span>
+                            <span v-if="audioState !== 'stopped'" style="
+                                font-size:11px; padding:2px 8px; border-radius:10px;
+                                color:white; font-weight:600;
+                            " :style="{ background: audioState === 'playing' ? '#4CAF50' : '#FF9800' }">
+                                {{ audioState === 'playing' ? '▶ Playing' : '⏸ Paused' }}
+                            </span>
+                        </div>
+
+                        <!-- Main Controls -->
+                        <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+                            <button @click="audioCommand('AUDIO_PREV')" title="Previous clip" style="
+                                padding:4px 10px; border:1px solid #81C784; border-radius:4px;
+                                background:white; cursor:pointer; font-size:14px;
+                            ">⏮</button>
+
+                            <button v-if="audioState !== 'playing'" @click="audioPlayOrResume" title="Play" style="
+                                padding:4px 14px; border:2px solid #2E7D32; border-radius:4px;
+                                background:#2E7D32; color:white; cursor:pointer; font-size:14px; font-weight:bold;
+                            ">▶</button>
+                            <button v-else @click="audioCommand('AUDIO_PAUSE')" title="Pause" style="
+                                padding:4px 14px; border:2px solid #FF9800; border-radius:4px;
+                                background:#FF9800; color:white; cursor:pointer; font-size:14px; font-weight:bold;
+                            ">⏸</button>
+
+                            <button @click="audioCommand('AUDIO_STOP')" title="Stop" style="
+                                padding:4px 10px; border:1px solid #f44336; border-radius:4px;
+                                background:white; color:#f44336; cursor:pointer; font-size:14px;
+                            ">⏹</button>
+
+                            <button @click="audioCommand('AUDIO_NEXT')" title="Next clip" style="
+                                padding:4px 10px; border:1px solid #81C784; border-radius:4px;
+                                background:white; cursor:pointer; font-size:14px;
+                            ">⏭</button>
+
+                            <!-- Spacer -->
+                            <span style="flex:1;"></span>
+
+                            <!-- Volume -->
+                            <label style="display:flex; align-items:center; gap:4px; font-size:11px; color:#555;">
+                                🔊
+                                <input type="range" min="0" max="100" v-model="audioVolume"
+                                    @input="audioCommand('AUDIO_VOLUME', { volume: audioVolume / 100 })"
+                                    style="width:60px; height:4px; cursor:pointer;" />
+                            </label>
+
+                            <!-- Playback Rate -->
+                            <select v-model="audioRate"
+                                @change="audioCommand('AUDIO_RATE', { rate: parseFloat(audioRate) })"
+                                style="padding:2px 4px; border:1px solid #ccc; border-radius:3px; font-size:11px; cursor:pointer;">
+                                <option value="0.5">0.5x</option>
+                                <option value="0.75">0.75x</option>
+                                <option value="1">1x</option>
+                                <option value="1.25">1.25x</option>
+                                <option value="1.5">1.5x</option>
+                                <option value="2">2x</option>
+                            </select>
+                        </div>
+
+                        <!-- Current highlight info -->
+                        <div v-if="audioHighlightText" style="
+                            margin-top:6px; padding:4px 8px; background:rgba(255,255,255,0.8);
+                            border-radius:4px; font-size:11px; color:#666;
+                            border-left:3px solid #FFEB3B;
+                        ">
+                            📍 Highlighting: <code style="color:#2E7D32;">{{ audioHighlightText }}</code>
+                            <span v-if="audioClipTime" style="color:#999;"> {{ audioClipTime }}</span>
+                        </div>
+
+                        <div style="margin-top:4px; font-size:10px; color:#777;">
+                            API: book.getMediaOverlay() → MediaOverlay (epub.js:395-552) — GSoC Stretch Goal
+                        </div>
+                    </div>
+
                     <div class="viewer-content">
                         <iframe ref="foliateFrame" src="./foliate-inner.html" @load="onFoliateIframeLoad"></iframe>
                         <div class="viewer-loading" v-if="!foliateReady">Loading...</div>
@@ -277,7 +376,7 @@ const App = {
                     <!-- Enhanced Footer for foliate-js -->
                     <div class="viewer-footer-enhanced">
                         <div class="progress-section">
-                            <div class="progress-label">Progress (SectionProgress byte-accurate):</div>
+                            <div class="progress-label">Progress (SectionProgress geometry — native EPUB class):</div>
                             <div class="progress-bar">
                                 <div class="progress-bar-fill"
                                      :class="{ green: true, complete: foliateComplete }"
@@ -396,8 +495,9 @@ const App = {
                     <div class="memory-panel clean">
                         <h4>CLEANUP COMPLETE (foliate-js)</h4>
                         <ul>
-                            <li>Loader.destroy() called — <strong>all blob URLs revoked</strong></li>
-                            <li>URL.revokeObjectURL() called <strong>{{ estimatedBlobCount }} times</strong></li>
+                            <li>book.destroy() called → Loader.destroy() → <strong>all blob URLs revoked</strong></li>
+                            <li>URL.revokeObjectURL() called on <strong>all entries in Loader.#cache Map</strong></li>
+                            <li>Paginator.destroy() → ResizeObserver disconnected</li>
                             <li>Event listeners — <strong>auto-removed by GC</strong></li>
                         </ul>
                         <div style="background:#C8E6C9;padding:8px;border-radius:4px;margin:8px 0;">
@@ -406,10 +506,11 @@ const App = {
                         <div v-if="foliateCleanupConfirmed"
                              style="background:#E8F5E9;padding:8px;border-radius:4px;margin:8px 0;border-left:3px solid #4CAF50;">
                             ✓ {{ foliateCleanupMessage }}<br>
-                            <small>Source: epub.js:906-908 (Loader.destroy)</small>
+                            <small>Source: EPUB.destroy() (epub.js:1080) → Loader.destroy() (epub.js:906-908)</small>
                         </div>
                         <div class="source">
-                            Source: epub.js:906-908 (Loader.destroy)
+                            Source: EPUB.destroy() (epub.js:1080-1081) → Loader.destroy() (epub.js:906-908)<br>
+                            Architecture: Native EPUB class + custom zip.js loader (view.js bypassed)
                         </div>
                     </div>
                 </div>
@@ -509,6 +610,15 @@ const App = {
         const searchProgress = ref(0);
         const foliateCurrentTheme = ref('Default');
         let foliateFrameLoaded = false;
+
+        // SMIL Media Overlay audio state (Phase 3)
+        const hasMediaOverlay = ref(false);
+        const mediaOverlaySections = ref(0);
+        const audioState = ref('stopped'); // 'stopped' | 'playing' | 'paused'
+        const audioHighlightText = ref('');
+        const audioClipTime = ref('');  // Current clip time display
+        const audioVolume = ref(100);   // Volume slider (0-100)
+        const audioRate = ref(1.0);     // Playback rate
 
         // Bug demonstration state
         const securityWarningShown = ref(false);
@@ -840,6 +950,12 @@ const App = {
                 if (currentFile.value) loadFoliate(currentFile.value);
             } else if (type === 'READY') {
                 foliateReady.value = true;
+                // Phase 3: Check SMIL availability from the native EPUB class
+                hasMediaOverlay.value = !!e.data.hasMediaOverlay;
+                mediaOverlaySections.value = e.data.mediaOverlaySections || 0;
+                if (e.data.hasMediaOverlay) {
+                    console.log(`[foliate] ♪ SMIL available: ${e.data.mediaOverlaySections} sections with audio`);
+                }
             } else if (type === 'RELOCATE') {
                 foliateProgress.value = Math.round((e.data.fraction || 0) * 100);
                 if (e.data.tocItem?.label) {
@@ -851,6 +967,19 @@ const App = {
                 foliateCleanupConfirmed.value = true;
                 foliateCleanupMessage.value = e.data.message || 'Cleanup completed';
                 console.log('[foliate] Memory cleanup:', e.data.message);
+
+            // SMIL audio state messages
+            } else if (type === 'AUDIO_STATE') {
+                audioState.value = e.data.state;
+            } else if (type === 'AUDIO_HIGHLIGHT') {
+                audioHighlightText.value = e.data.text?.split('/').pop() || e.data.text;
+                if (typeof e.data.begin === 'number' && typeof e.data.end === 'number') {
+                    audioClipTime.value = `[${e.data.begin.toFixed(1)}s → ${e.data.end.toFixed(1)}s]`;
+                }
+            } else if (type === 'AUDIO_UNHIGHLIGHT') {
+                // Don't clear immediately — next highlight will replace
+            } else if (type === 'AUDIO_ERROR') {
+                console.error('[foliate] Audio error:', e.data.message);
             } else if (type === 'SEARCH_RESULTS') {
                 searchResults.value = e.data.results || [];
             } else if (type === 'SEARCH_DONE') {
@@ -869,12 +998,35 @@ const App = {
                 triggeredBugs.value.push('memory');
             }
 
+            // Also send DESTROY message to foliate iframe to demonstrate cleanup
+            foliateFrame.value?.contentWindow?.postMessage({ type: 'DESTROY' }, window.location.origin);
+
             console.group('[Memory Leak Demo]');
             console.warn('[epub.js] book.destroy() NOT called');
             console.warn('[epub.js] rendition.destroy() NOT called');
             console.warn('[epub.js] Blob URLs revoked: 0 of ' + estimatedBlobCount.value);
-            console.log('[foliate-js] Loader.destroy() called - all ' + estimatedBlobCount.value + ' blob URLs revoked');
+            console.log('[foliate-js] book.destroy() → Loader.destroy() — all cached blob URLs revoked');
+            console.log('[foliate-js] Architecture: Native EPUB class + custom zip.js loader (view.js bypassed)');
             console.groupEnd();
+        }
+
+        // ============================================================
+        // SMIL MEDIA OVERLAY — Audio control helpers (Phase 3)
+        // ============================================================
+        function audioCommand(type, extraData = {}) {
+            foliateFrame.value?.contentWindow?.postMessage({
+                type,
+                ...extraData
+            }, window.location.origin);
+        }
+
+        function audioPlayOrResume() {
+            if (audioState.value === 'paused') {
+                audioCommand('AUDIO_RESUME');
+            } else {
+                // Start from section 0 (MediaOverlay.start() auto-advances)
+                audioCommand('AUDIO_PLAY', { sectionIndex: 0 });
+            }
         }
 
         // Search functionality
@@ -904,6 +1056,10 @@ const App = {
             { name: 'Grey', bg: '#e8e8e8', fg: '#333333' }
         ];
 
+        // Rule 7: Theming via paginator.setStyles()
+        // This injects CSS through the iframe isolation boundary by appending
+        // <style> elements to the content document head (paginator.js:978-983).
+        // NOT Shadow DOM — direct iframe document style injection.
         function applyTheme(theme) {
             const css = `
                 html, body {
@@ -976,7 +1132,17 @@ const App = {
             triggerMemoryDemo,
             performSearch,
             goToSearchResult,
-            applyTheme
+            applyTheme,
+            // SMIL audio (Phase 3)
+            hasMediaOverlay,
+            mediaOverlaySections,
+            audioState,
+            audioHighlightText,
+            audioClipTime,
+            audioVolume,
+            audioRate,
+            audioCommand,
+            audioPlayOrResume
         };
     }
 };

@@ -3,12 +3,22 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!--
+        CSP Rationale:
+        - blob: needed because foliate-js Loader.createURL() creates blob: URLs for all
+          EPUB resources (HTML sections, images, CSS, fonts).
+        - 'unsafe-inline' needed because foliate-js paginator.js injects inline styles
+          via setStylesImportant() to control CSS multi-column layout (paginator.js:206-208).
+        - frame-src blob: because the Paginator creates sandboxed iframes loaded with blob: URLs.
+        - This CSP mirrors Kolibri's production CSP from kolibri-sandbox/iframe.html and
+          zip_wsgi.py: "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:"
+    -->
     <meta http-equiv="Content-Security-Policy"
           content="default-src 'self' blob:; script-src 'self' 'unsafe-inline';
                    style-src 'self' blob: 'unsafe-inline';
                    img-src 'self' blob: data:;
                    frame-src blob: data:;">
-    <title>Foliate Viewer</title>
+    <title>Foliate Viewer — Native EPUB Class</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         html, body {
@@ -29,7 +39,14 @@
             position: relative;
             overflow: hidden;
         }
-        foliate-view {
+        /*
+            Architecture Note: We use <foliate-paginator> directly, NOT <foliate-view>.
+            The paginator is the core rendering engine — a Web Component that manages
+            CSS multi-column layout, touch handling, and section loading.
+            view.js wraps this in <foliate-view> (a Shadow DOM wrapper), but we bypass
+            that entirely per the agreed architecture with Richard Tibbles.
+        */
+        foliate-paginator {
             width: 100%;
             height: 100%;
         }
@@ -52,105 +69,379 @@
     </div>
 
     <script type="module">
-        // Import foliate-js View class - this auto-registers 'foliate-view' custom element
-        import './foliate-js/view.js';
+        // ============================================================================
+        // ARCHITECTURE: Bypass view.js — Native EPUB Class with Custom zip.js Loader
+        //
+        // This file implements the exact architecture agreed upon with Richard Tibbles
+        // for the Kolibri EPUB viewer migration (GSoC 2026):
+        //
+        //   1. Import { EPUB } from 'foliate-js/epub.js' — NOT view.js
+        //   2. Implement a Custom Loader using zip.js — emulating kolibri-zip (PR #12805)
+        //   3. Instantiate EPUB with the custom loader: new EPUB(customLoader)
+        //   4. Use <foliate-paginator> directly for rendering
+        //   5. Use SectionProgress for geometry-based progress tracking
+        //   6. Call book.destroy() for cleanup (revokes all internal blob URLs)
+        //
+        // In production Kolibri, the custom loader will bridge to kolibri-zip's
+        // ZipFile.file() API. This prototype uses zip.js directly to demonstrate
+        // the same extraction pattern.
+        // ============================================================================
 
-        // Security: Only accept messages from parent window origin
+        // Rule 1: Bypass view.js — import the core EPUB class directly
+        import { EPUB } from './foliate-js/epub.js';
+
+        // Import the Paginator — this auto-registers <foliate-paginator> custom element
+        // The Paginator handles: CSS multi-column layout, pagination, touch/swipe,
+        // ResizeObserver (paginator.js:430,558), and section loading/unloading.
+        import './foliate-js/paginator.js';
+
+        // Import SectionProgress for geometry-based progress tracking (Rule 5)
+        // This replaces the broken locations.generate(1000) from epub.js.
+        // SectionProgress uses section byte sizes to compute accurate progress
+        // fractions: progress = currentSectionOffset / totalBookSize
+        import { TOCProgress, SectionProgress } from './foliate-js/progress.js';
+
+        // Rule 3: Import zip.js for the custom loader — same library used by
+        // kolibri-zip after PR #12805 refactor (was fflate, now zip.js)
+        import { configure, ZipReader, BlobReader, TextWriter, BlobWriter }
+            from './foliate-js/vendor/zip.js';
+
+        // Security: Only accept messages from parent window
         const PARENT_ORIGIN = window.location.origin || 'http://localhost:8082';
 
         const viewer = document.getElementById('viewer');
         const status = document.getElementById('status');
-        let view = null;
 
-        // Send message to parent
-        function postToParent(type, data = {}) {
-            window.parent.postMessage({ type, ...data }, PARENT_ORIGIN);
+        // State: EPUB book and paginator instances
+        let book = null;
+        let paginator = null;
+        let sectionProgress = null;
+        let tocProgress = null;
+
+        // ============================================================================
+        // SMIL MEDIA OVERLAY — State for audio read-aloud (GSoC stretch goal)
+        //
+        // MediaOverlay (epub.js:395-552) synchronizes audio playback with text
+        // highlighting using SMIL (Synchronized Multimedia Integration Language).
+        // It exposes: start(), pause(), resume(), stop(), prev(), next(),
+        //             setVolume(), setRate()
+        // Events:      'highlight' — fires when text should be highlighted
+        //              'unhighlight' — fires when highlight should be removed
+        //
+        // The highlight event detail contains: { text, begin, end }
+        // where 'text' is the SMIL text reference (e.g., 'chapter1.xhtml#p1')
+        // and begin/end are the audio clip boundaries in seconds.
+        // ============================================================================
+        let mediaOverlay = null;
+        let audioState = 'stopped'; // 'stopped' | 'playing' | 'paused'
+
+        // ============================================================================
+        // CUSTOM LOADER — The Bridge Between zip.js and foliate-js EPUB Class
+        //
+        // This is the heart of the integration. The EPUB class constructor
+        // (epub.js:936) expects an object with exactly these three methods:
+        //   - loadText(name)   → returns Promise<string>
+        //   - loadBlob(name, type) → returns Promise<Blob>  (Rule 4: extract to Blob)
+        //   - getSize(name)    → returns number
+        //
+        // In Kolibri production, this loader will call:
+        //   kolibriZip.file(name).async('text')    → loadText
+        //   kolibriZip.file(name).async('blob')    → loadBlob
+        //   kolibriZip.file(name).uncompressedSize → getSize
+        //
+        // For this standalone prototype, we use zip.js directly.
+        // ============================================================================
+        async function createCustomLoader(file) {
+            console.log('[foliate] Creating custom zip.js loader for:', file.name);
+
+            // Configure zip.js — disable web workers for iframe compatibility
+            // This matches foliate-js's own configuration in makeZipLoader (view.js:33)
+            // and is necessary because blob: URL workers can't be created inside
+            // sandboxed iframes in some browsers.
+            configure({ useWebWorkers: false });
+
+            // Open the EPUB (which is a ZIP archive) using BlobReader
+            // Rule 3: Use zip.js, not fflate — matching kolibri-zip PR #12805
+            const reader = new ZipReader(new BlobReader(file));
+            const entries = await reader.getEntries();
+
+            // Build a lookup map: filename → ZipEntry
+            // This provides O(1) access to any file in the EPUB by path
+            const entryMap = new Map(entries.map(entry => [entry.filename, entry]));
+
+            console.log(`[foliate] Zip entries loaded: ${entries.length} files`);
+
+            // Rule 2: The Custom Loader API — three methods, exactly matching
+            // what EPUB constructor expects (epub.js:936-939)
+            const customLoader = {
+                // Extract a file from the EPUB as text (used for XML, XHTML, CSS)
+                loadText(name) {
+                    const entry = entryMap.get(name);
+                    if (!entry) return null;
+                    return entry.getData(new TextWriter());
+                },
+
+                // Rule 4: Extract a file from the EPUB as a Blob object
+                // No largeFileUrlGenerator — extract everything directly to Blob
+                // In production Kolibri, this would call kolibriZip.file(name).async('blob')
+                loadBlob(name, type) {
+                    const entry = entryMap.get(name);
+                    if (!entry) return null;
+                    return entry.getData(new BlobWriter(type));
+                },
+
+                // Return the uncompressed size of a file (used by SectionProgress
+                // for byte-accurate progress calculation)
+                getSize(name) {
+                    return entryMap.get(name)?.uncompressedSize ?? 0;
+                }
+            };
+
+            return customLoader;
         }
 
-        // Show status message
-        function showStatus(msg, isError = false) {
-            status.textContent = msg;
-            status.className = 'status' + (isError ? ' error' : '');
-            status.style.display = 'flex';
-        }
-
-        // Hide status
-        function hideStatus() {
-            status.style.display = 'none';
-        }
-
-        // Open book
+        // ============================================================================
+        // OPEN BOOK — Native EPUB instantiation pipeline
+        // ============================================================================
         async function openBook(file) {
-            console.log('[foliate] Opening:', file?.name);
+            console.log('[foliate] Opening with NATIVE EPUB class (view.js bypassed):', file?.name);
             showStatus('Loading...');
 
             try {
-                // Remove existing view if any
-                if (view) {
-                    // Memory cleanup: Call close() to invoke Loader.destroy()
-                    try {
-                        view.close();
-                        postToParent('CLEANUP_COMPLETE', {
-                            message: 'Loader.destroy() called — all blob URLs revoked'
-                        });
-                    } catch(e) {
-                        // close() may not exist in all versions
-                        console.warn('[foliate] view.close() not available:', e);
-                    }
-                    view.remove();
-                    view = null;
+                // Rule 6: Memory Cleanup — destroy previous book instance
+                // book.destroy() calls Loader.destroy() (epub.js:1080-1081)
+                // which revokes ALL cached blob URLs via URL.revokeObjectURL()
+                // (epub.js:906-908). This is the correct cleanup path.
+                if (book) {
+                    book.destroy();
+                    postToParent('CLEANUP_COMPLETE', {
+                        message: 'book.destroy() called — Loader.destroy() revoked all blob URLs'
+                    });
+                    console.log('[foliate] Previous book destroyed, blob URLs revoked');
                 }
 
-                // Create new foliate-view element
-                view = document.createElement('foliate-view');
-                viewer.appendChild(view);
+                // Clean up previous paginator
+                if (paginator) {
+                    paginator.destroy();
+                    paginator.remove();
+                    paginator = null;
+                }
 
-                // Listen for progress updates
-                view.addEventListener('relocate', (e) => {
-                    const { fraction, location, tocItem, cfi } = e.detail || {};
+                // Step 1: Create the custom zip.js loader (Rule 2, 3, 4)
+                const customLoader = await createCustomLoader(file);
+
+                // Step 2: Instantiate the EPUB class with our custom loader (Rule 1, 2)
+                // The EPUB constructor (epub.js:936) stores loadText, loadBlob, getSize
+                // and creates the Encryption handler.
+                book = new EPUB(customLoader);
+
+                // Step 3: Initialize — parses container.xml, OPF, navigation, metadata
+                // This triggers: loadText('META-INF/container.xml') → parse OPF →
+                // create Resources → create internal Loader → build sections array
+                await book.init();
+
+                console.log('[foliate] Book initialized:', {
+                    title: book.metadata?.title,
+                    language: book.metadata?.language,
+                    sections: book.sections?.length,
+                    dir: book.dir
+                });
+
+                // Step 4: Set up progress tracking (Rule 5)
+                // Use SectionProgress for geometry-based progress — NOT locations.generate()
+                // SectionProgress calculates progress as: bytesRead / totalBytes
+                // where each section's byte size comes from getSize() in our custom loader
+                sectionProgress = new SectionProgress(book.sections, 1500, 1600);
+
+                // Set up TOC progress for chapter names
+                if (book.splitTOCHref && book.getTOCFragment) {
+                    const ids = book.sections.map(s => s.id);
+                    const splitHref = book.splitTOCHref.bind(book);
+                    const getFragment = book.getTOCFragment.bind(book);
+                    tocProgress = new TOCProgress();
+                    await tocProgress.init({
+                        toc: book.toc ?? [], ids, splitHref, getFragment
+                    });
+                }
+
+                // Step 5: Create the paginator (bypassing view.js's Shadow DOM wrapper)
+                // The Paginator is the actual rendering engine — it handles:
+                //   - CSS multi-column layout (paginator.js:309-339)
+                //   - Built-in ResizeObserver (paginator.js:430,558) — no manual one needed
+                //   - Touch/swipe navigation (paginator.js:567-574)
+                //   - Section loading/unloading lifecycle
+                //
+                // Architecture Mitigation for Bypassing view.js:
+                // The Paginator's ResizeObserver automatically handles container resize
+                // (tablet rotation, window resize). view.js only adds:
+                //   1. Language/dir detection — we do this ourselves below
+                //   2. History management — not needed for this prototype
+                //   3. Search/annotations — handled separately
+                paginator = document.createElement('foliate-paginator');
+                viewer.appendChild(paginator);
+
+                // Step 6: Wire up the paginator events
+                // The 'relocate' event fires on every page turn with fraction/range/index
+                paginator.addEventListener('relocate', (e) => {
+                    const { index, fraction, size, range } = e.detail;
+
+                    // Rule 5: Use SectionProgress for geometry-based progress
+                    // This produces a global book fraction (0..1) from the section-local
+                    // fraction, weighted by each section's byte size
+                    const progress = sectionProgress.getProgress(index, fraction, size);
+
+                    // Get current TOC item for chapter display
+                    const tocItem = tocProgress?.getProgress(index, range) ?? null;
+
                     postToParent('RELOCATE', {
-                        fraction: fraction || 0,
-                        location: location || {},
-                        tocItem: tocItem || null,
-                        cfi: cfi || ''
+                        fraction: progress?.fraction ?? 0,
+                        location: progress ?? {},
+                        tocItem: tocItem,
+                        cfi: ''
                     });
                 });
 
-                // Create a promise that resolves on first load
-                const firstLoadPromise = new Promise(resolve => {
-                    view.addEventListener('load', resolve, { once: true });
-                });
+                paginator.addEventListener('load', (e) => {
+                    const { doc } = e.detail;
 
-                // Listen for subsequent load events
-                view.addEventListener('load', () => {
+                    // Architecture Mitigation for Bypassing view.js:
+                    // view.js sets lang/dir on loaded documents (view.js:338-341).
+                    // We must do this ourselves since we bypassed the wrapper.
+                    if (book.metadata?.language) {
+                        try {
+                            const lang = Array.isArray(book.metadata.language)
+                                ? book.metadata.language[0]
+                                : book.metadata.language;
+                            if (lang) {
+                                const canonical = Intl.getCanonicalLocales(lang)[0];
+                                doc.documentElement.lang ||= canonical ?? '';
+                                const locale = new Intl.Locale(canonical);
+                                const isCJK = ['zh', 'ja', 'kr'].includes(locale.language);
+                                const direction = (locale.getTextInfo?.() ?? locale.textInfo)?.direction;
+                                if (!isCJK) doc.documentElement.dir ||= direction ?? '';
+                            }
+                        } catch (e) {
+                            console.warn('[foliate] Language detection error:', e);
+                        }
+                    }
+
                     console.log('[foliate] Section loaded');
                 });
 
-                // Open the EPUB file
-                await view.open(file);
+                // Step 7: Open the book in the paginator
+                // paginator.open() (paginator.js:646-664) stores the sections array
+                // and sets up CSS transform hooks for -epub- prefix removal
+                paginator.open(book);
 
-                // Trigger initial render (required by foliate-js)
-                if (view.renderer && typeof view.renderer.next === 'function') {
-                    view.renderer.next();
-                } else {
-                    console.warn('[foliate] view.renderer not available after open()');
-                }
-
-                // Wait for the first section to load before navigating
-                await firstLoadPromise;
+                // Step 8: Navigate to the first section
+                // Load the first linear section and display it
+                const firstIndex = book.sections.findIndex(s => s.linear !== 'no');
+                await paginator.goTo({ index: firstIndex >= 0 ? firstIndex : 0 });
 
                 hideStatus();
 
-                // Send ready with metadata
-                const book = view.book;
+                // ====================================================
+                // SMIL MEDIA OVERLAY — Initialize (Phase 3 Enhancement)
+                // ====================================================
+                // Check if ANY section has a mediaOverlay reference.
+                // This is set in the OPF manifest via media-overlay="..." attribute
+                // on <item> elements. EPUB.init() populates section.mediaOverlay
+                // from the Resources class (epub.js:981-998).
+                const hasSMIL = book.sections.some(s => s.mediaOverlay);
+                if (hasSMIL) {
+                    // book.getMediaOverlay() (epub.js:1042-1043) creates a new
+                    // MediaOverlay(this, this.#loadXML.bind(this))
+                    mediaOverlay = book.getMediaOverlay();
+
+                    // Wire up highlight/unhighlight events — these fire during
+                    // audio playback as the current time passes each clipBegin/clipEnd
+                    // boundary defined in the SMIL file.
+                    mediaOverlay.addEventListener('highlight', (e) => {
+                        const { text, begin, end } = e.detail;
+                        audioState = 'playing';
+                        postToParent('AUDIO_HIGHLIGHT', {
+                            text,               // e.g., 'OEBPS/chapter1.xhtml#p1'
+                            begin,              // clip start time in seconds
+                            end,                // clip end time in seconds
+                            state: audioState
+                        });
+                        console.log(`[foliate] ♪ Highlight: ${text} [${begin?.toFixed(2)}s → ${end?.toFixed(2)}s]`);
+
+                        // Navigate paginator to the highlighted section's element
+                        // The text reference is the fragment ID (after #)
+                        const fragmentId = text?.split('#')[1];
+                        if (fragmentId && paginator) {
+                            try {
+                                const doc = paginator.getContents()?.[0]?.doc;
+                                if (doc) {
+                                    const el = doc.getElementById(fragmentId);
+                                    if (el) {
+                                        // Add the EPUB media overlay active class
+                                        // This class is defined in the EPUB's CSS:
+                                        //   .-epub-media-overlay-active { background: yellow; }
+                                        // The class name comes from the OPF metadata:
+                                        //   <meta property="media:active-class">...</meta>
+                                        const activeClass = book.media?.activeClass
+                                            || '-epub-media-overlay-active';
+                                        // Remove from previous
+                                        doc.querySelectorAll('.' + activeClass)
+                                            .forEach(el => el.classList.remove(activeClass));
+                                        el.classList.add(activeClass);
+                                    }
+                                }
+                            } catch (err) {
+                                console.warn('[foliate] Highlight DOM error:', err);
+                            }
+                        }
+                    });
+
+                    mediaOverlay.addEventListener('unhighlight', (e) => {
+                        const { text } = e.detail;
+                        postToParent('AUDIO_UNHIGHLIGHT', { text });
+
+                        // Remove highlight class from the element
+                        const fragmentId = text?.split('#')[1];
+                        if (fragmentId && paginator) {
+                            try {
+                                const doc = paginator.getContents()?.[0]?.doc;
+                                if (doc) {
+                                    const activeClass = book.media?.activeClass
+                                        || '-epub-media-overlay-active';
+                                    const el = doc.getElementById(fragmentId);
+                                    if (el) el.classList.remove(activeClass);
+                                }
+                            } catch (err) {
+                                console.warn('[foliate] Unhighlight DOM error:', err);
+                            }
+                        }
+                    });
+
+                    mediaOverlay.addEventListener('error', (e) => {
+                        console.error('[foliate] MediaOverlay error:', e.detail);
+                        postToParent('AUDIO_ERROR', { message: String(e.detail) });
+                    });
+
+                    console.log('[foliate] ♪ SMIL Media Overlay ready —',
+                        book.sections.filter(s => s.mediaOverlay).length,
+                        'sections have audio');
+                }
+
+                // Signal ready to parent with metadata
                 postToParent('READY', {
-                    title: book?.metadata?.title || file.name,
-                    author: book?.metadata?.author || '',
-                    language: book?.metadata?.language || '',
-                    sections: book?.sections?.length || 0
+                    title: book.metadata?.title || file.name,
+                    author: book.metadata?.author?.map?.(a => typeof a === 'string' ? a : a.name)?.join(', ')
+                        || (typeof book.metadata?.author === 'string' ? book.metadata.author : ''),
+                    language: book.metadata?.language || '',
+                    sections: book.sections?.length || 0,
+                    // Signal SMIL availability to parent — this controls whether
+                    // the audio control panel is shown in the UI
+                    hasMediaOverlay: hasSMIL,
+                    mediaOverlaySections: hasSMIL
+                        ? book.sections.filter(s => s.mediaOverlay).length : 0,
+                    mediaDuration: book.media?.duration || null
                 });
 
-                console.log('[foliate] Book ready:', book?.metadata?.title);
+                console.log('[foliate] Book ready:', book.metadata?.title);
 
             } catch (err) {
                 console.error('[foliate] Error:', err);
@@ -159,73 +450,86 @@
             }
         }
 
-        // Search functionality
+        // ============================================================================
+        // SEARCH — Using the EPUB core's createDocument() method
+        // ============================================================================
         async function performSearch(query) {
-            if (!view || !query) return;
-            const results = [];
+            if (!book || !query) return;
             try {
-                for await (const result of view.search({ query, index: 0 })) {
-                    if (result.progress !== undefined) {
-                        // Send progress update to parent
-                        postToParent('SEARCH_PROGRESS', {
-                            progress: result.progress
-                        });
-                    }
-                    if (result.subitems) {
-                        results.push(...result.subitems);
-                        // Send results progressively
+                const { searchMatcher } = await import('./foliate-js/search.js');
+                const { textWalker } = await import('./foliate-js/text-walker.js');
+                const matcher = searchMatcher(textWalker, { query });
+                const results = [];
+
+                for (const [index, section] of book.sections.entries()) {
+                    if (!section.createDocument) continue;
+                    const doc = await section.createDocument();
+                    const subitems = Array.from(matcher(doc, query), ({ range, excerpt }) => ({
+                        cfi: '', // CFI generation would require full implementation
+                        excerpt,
+                        text: excerpt?.match || ''
+                    }));
+
+                    postToParent('SEARCH_PROGRESS', {
+                        progress: (index + 1) / book.sections.length
+                    });
+
+                    if (subitems.length) {
+                        results.push(...subitems);
                         postToParent('SEARCH_RESULTS', {
                             results: results.slice(0, 20),
                             total: results.length
                         });
                     }
                 }
-                postToParent('SEARCH_DONE', {
-                    total: results.length
-                });
-            } catch(e) {
+
+                postToParent('SEARCH_DONE', { total: results.length });
+            } catch (e) {
                 console.error('[foliate] Search error:', e);
             }
         }
 
-        // Navigate to location
-        function goTo(target) {
-            if (view) {
-                view.goTo(target);
-            }
-        }
-
-        // Navigation
+        // ============================================================================
+        // NAVIGATION
+        // ============================================================================
         function goNext() {
-            if (view) {
-                view.goRight();
-            }
+            if (!paginator) return;
+            // Paginator handles RTL direction automatically via bookDir
+            if (book?.dir === 'rtl') paginator.prev();
+            else paginator.next();
         }
 
         function goPrev() {
-            if (view) {
-                view.goLeft();
-            }
+            if (!paginator) return;
+            if (book?.dir === 'rtl') paginator.next();
+            else paginator.prev();
         }
 
-        function goToFraction(frac) {
-            if (view) {
-                view.goToFraction(frac);
-            }
+        // ============================================================================
+        // MESSAGING — Parent frame communication
+        // ============================================================================
+        function postToParent(type, data = {}) {
+            window.parent.postMessage({ type, ...data }, PARENT_ORIGIN);
+        }
+
+        function showStatus(msg, isError = false) {
+            status.textContent = msg;
+            status.className = 'status' + (isError ? ' error' : '');
+            status.style.display = 'flex';
+        }
+
+        function hideStatus() {
+            status.style.display = 'none';
         }
 
         // Listen for messages from parent
         window.addEventListener('message', async (e) => {
-            // Security: Only accept messages from our parent window
             if (e.source !== window.parent) return;
-
             const { type } = e.data || {};
 
             switch (type) {
                 case 'OPEN_BOOK':
-                    if (e.data.file) {
-                        await openBook(e.data.file);
-                    }
+                    if (e.data.file) await openBook(e.data.file);
                     break;
                 case 'NEXT':
                     goNext();
@@ -234,39 +538,135 @@
                     goPrev();
                     break;
                 case 'GO_TO':
-                    if (typeof e.data.fraction === 'number') {
-                        goToFraction(e.data.fraction);
+                    if (typeof e.data.fraction === 'number' && sectionProgress) {
+                        const [index, anchor] = sectionProgress.getSection(e.data.fraction);
+                        paginator?.goTo({ index, anchor });
                     }
                     break;
                 case 'SEARCH':
-                    if (e.data.query) {
-                        await performSearch(e.data.query);
-                    }
-                    break;
-                case 'GOTO':
-                    if (e.data.target) {
-                        goTo(e.data.target);
-                    }
+                    if (e.data.query) await performSearch(e.data.query);
                     break;
                 case 'SET_THEME':
-                    if (view?.renderer && e.data.css) {
-                        view.renderer.setStyles(e.data.css);
+                    // Rule 7: Theming via paginator.setStyles() — injects CSS through
+                    // the iframe isolation boundary using <style> elements in the
+                    // content document head (paginator.js:978-983, 1100-1117).
+                    // This is NOT Shadow DOM injection — it's direct iframe document
+                    // style injection, which works because the Paginator creates its
+                    // own sandboxed iframes for content.
+                    if (paginator && e.data.css) {
+                        paginator.setStyles(e.data.css);
                     }
+                    break;
+                case 'DESTROY':
+                    // Explicit cleanup request from parent (e.g., Vue beforeDestroy)
+                    if (mediaOverlay) {
+                        mediaOverlay.stop();
+                        mediaOverlay = null;
+                        audioState = 'stopped';
+                    }
+                    if (book) {
+                        book.destroy();
+                        book = null;
+                    }
+                    if (paginator) {
+                        paginator.destroy();
+                        paginator.remove();
+                        paginator = null;
+                    }
+                    break;
+
+                // ==========================================================
+                // SMIL MEDIA OVERLAY — Audio control messages (Phase 3)
+                //
+                // These map 1:1 to MediaOverlay methods (epub.js:495-551).
+                // The parent sends these based on user interaction with
+                // the audio control panel in app.js.
+                // ==========================================================
+                case 'AUDIO_PLAY': {
+                    if (!mediaOverlay) break;
+                    // Start playback from the current section index
+                    // MediaOverlay.start(sectionIndex) loads the SMIL file,
+                    // creates an Audio object from the blob URL, and begins
+                    // playing with timeupdate-based highlight tracking.
+                    const currentIndex = e.data.sectionIndex ?? 0;
+                    mediaOverlay.start(currentIndex);
+                    audioState = 'playing';
+                    postToParent('AUDIO_STATE', { state: 'playing' });
+                    console.log('[foliate] ♪ Audio play — section', currentIndex);
+                    break;
+                }
+                case 'AUDIO_PAUSE':
+                    if (!mediaOverlay) break;
+                    mediaOverlay.pause();
+                    audioState = 'paused';
+                    postToParent('AUDIO_STATE', { state: 'paused' });
+                    console.log('[foliate] ♪ Audio paused');
+                    break;
+                case 'AUDIO_RESUME':
+                    if (!mediaOverlay) break;
+                    mediaOverlay.resume();
+                    audioState = 'playing';
+                    postToParent('AUDIO_STATE', { state: 'playing' });
+                    console.log('[foliate] ♪ Audio resumed');
+                    break;
+                case 'AUDIO_STOP':
+                    if (!mediaOverlay) break;
+                    mediaOverlay.stop();
+                    audioState = 'stopped';
+                    postToParent('AUDIO_STATE', { state: 'stopped' });
+                    console.log('[foliate] ♪ Audio stopped');
+                    break;
+                case 'AUDIO_PREV':
+                    if (!mediaOverlay) break;
+                    mediaOverlay.prev();
+                    console.log('[foliate] ♪ Audio prev');
+                    break;
+                case 'AUDIO_NEXT':
+                    if (!mediaOverlay) break;
+                    mediaOverlay.next();
+                    console.log('[foliate] ♪ Audio next');
+                    break;
+                case 'AUDIO_VOLUME':
+                    if (!mediaOverlay) break;
+                    mediaOverlay.setVolume(e.data.volume ?? 1);
+                    console.log('[foliate] ♪ Volume:', e.data.volume);
+                    break;
+                case 'AUDIO_RATE':
+                    if (!mediaOverlay) break;
+                    mediaOverlay.setRate(e.data.rate ?? 1);
+                    console.log('[foliate] ♪ Rate:', e.data.rate);
                     break;
             }
         });
 
-        // Signal ready
+        // Signal ready to parent
         postToParent('FRAME_READY');
-        console.log('[foliate] Frame ready');
+        console.log('[foliate] Frame ready — using NATIVE EPUB class (view.js bypassed)');
 
-        // Memory cleanup: Clean up on page unload
+        // Rule 6: Memory cleanup on page unload
+        // book.destroy() → Loader.destroy() → revokes ALL cached blob URLs
+        // The Loader class (epub.js:706-908) maintains a #cache Map of all
+        // blob URLs it created, and destroy() iterates and revokes them all.
+        //
+        // Stress-Test Q2 Answer — Blob Garbage Collector:
+        // book.destroy() handles ALL blob URL revocation. The Loader's #cache
+        // captures every URL created by createURL() (epub.js:727). Our custom
+        // loader only returns raw Blob objects (not blob URLs), so those are
+        // handled by normal GC. No manual registry needed.
         window.addEventListener('beforeunload', () => {
-            if (view) {
+            if (book) {
                 try {
-                    view.close();
+                    book.destroy();
+                    console.log('[foliate] Cleanup: book.destroy() — all blob URLs revoked');
                 } catch(e) {
                     console.warn('[foliate] Error during cleanup:', e);
+                }
+            }
+            if (paginator) {
+                try {
+                    paginator.destroy();
+                } catch(e) {
+                    console.warn('[foliate] Error during paginator cleanup:', e);
                 }
             }
         });
